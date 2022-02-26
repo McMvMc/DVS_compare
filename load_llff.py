@@ -6,6 +6,12 @@ import numpy as np
 from utils.flow_utils import resize_flow
 from run_nerf_helpers import get_grid
 
+import torch
+import torch.nn.functional as F
+
+h, w = [504, 896]
+orig_h, orig_w = [1080, 1920]
+
 
 def _minify(basedir, factors=[], resolutions=[]):
     needtoload = False
@@ -196,6 +202,177 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     return poses, bds, imgs, disp, masks, flows_f, flow_masks_f, flows_b, flow_masks_b
 
 
+def _load_data_DFVS(basedir, start_frame, end_frame, args,
+               factor=None, width=None, height=None,
+               load_imgs=True, evaluation=False):
+    print('factor ', factor)
+    all_poses = {}
+    all_bds = {}
+    all_imgs = {}
+    all_disp = {}
+    all_masks = {}
+    all_dist_masks = {}
+    all_flows_f = {}
+    all_flow_masks_f = {}
+    all_flows_b = {}
+    all_flow_masks_b = {}
+    for serial in args.serial_list:
+        scale = h / orig_h
+        pose_file = torch.load(basedir+f'{serial}_pose.pt', map_location='cpu')
+        poses = np.zeros((3, 5))  # note: poses are positions and orientations here
+        poses[:3, :3] = pose_file['R'].detach().cpu().numpy().T
+        poses[:3, 3:4] = -poses[:3, :3] @ pose_file['T'].detach().cpu().numpy()
+        poses[0, 4] = h
+        poses[1, 4] = w
+        K = pose_file['K'].detach().cpu().numpy() * scale
+        K[2, 2] = 1.
+        poses[2, 4] = (K[0,0] + K[1,1]) /2.
+
+        sh = [h, w]
+
+        sfx = ''
+
+        if factor is not None:
+            sfx = '_{}'.format(factor)
+            factor = factor
+        elif height is not None:
+            factor = sh[0] / float(height)
+            width = int(round(sh[1] / factor))
+            sfx = '_{}x{}'.format(width, height)
+        elif width is not None:
+            factor = sh[1] / float(width)
+            width = int(round(sh[0] / factor))
+            sfx = '_{}x{}'.format(width, height)
+        else:
+            factor = 1
+
+        imgdir = os.path.join(basedir, f'{serial}/images' + sfx)
+        if not os.path.exists(imgdir):
+            print(imgdir, 'does not exist, returning')
+            return
+
+        imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
+                    if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+        imgfiles = imgfiles[start_frame:end_frame]
+
+        sh = imageio.imread(imgfiles[0]).shape
+
+        n_frames = len(imgfiles)
+        poses[:2, 4:5] = np.array(sh[:2]).reshape([2, 1])
+        poses[2, 4] = poses[2, 4] * 1. / factor
+        poses = poses[..., None].repeat(n_frames, axis=-1)
+        bds = np.array([0.5, 10.]).T[..., None].repeat(n_frames, axis=-1)
+
+        if not load_imgs:
+            return poses, bds
+
+        def imread(f):
+            if f.endswith('png'):
+                return imageio.imread(f, ignoregamma=True)
+            else:
+                return imageio.imread(f)
+
+        imgs = [imread(f)[..., :3] / 255. for f in imgfiles]
+        imgs = np.stack(imgs, -1)
+
+        if evaluation:
+            return poses, bds, imgs,
+
+        depth_dir = os.path.join(basedir, f'{serial}/depth')
+
+        depthfiles = [os.path.join(depth_dir, f) \
+                      for f in sorted(os.listdir(depth_dir)) if f.endswith('pt')]
+        depthfiles = depthfiles[start_frame:end_frame]
+
+        disp = []
+        for f in depthfiles:
+            cur_depth = F.interpolate(torch.load(f, map_location='cpu')[None].float(),
+                                      (imgs.shape[0], imgs.shape[1]), mode='nearest')[0, 0]
+            invalid_mask = cur_depth < 0.1
+            cur_depth = 1. / cur_depth.numpy()
+            cur_depth[invalid_mask] = 1/8.
+            disp.append(cur_depth)
+        disp = np.stack(disp, -1)
+
+        all_poses[serial] = poses
+        all_bds[serial] = bds
+        all_imgs[serial] = imgs
+        all_disp[serial] = disp
+        all_dist_masks[serial] = torch.load(basedir+f'{serial}/valid_mask.pt', map_location='cpu')
+
+        if serial != args.gt_serial:
+            mask_dir = os.path.join(basedir, serial, 'motion_masks')
+            maskfiles = [os.path.join(mask_dir, f) \
+                         for f in sorted(os.listdir(mask_dir)) if f.endswith('png')]
+            maskfiles = maskfiles[start_frame:end_frame]
+
+            masks = [cv2.resize(imread(f) / 255., (imgs.shape[1], imgs.shape[0]),
+                                interpolation=cv2.INTER_NEAREST) for f in maskfiles]
+            masks = np.stack(masks, -1)
+            masks = np.float32(masks > 1e-3)
+
+            flow_dir = os.path.join(basedir, serial, 'flow_i1')
+            flows_f = []
+            flow_masks_f = []
+            flows_b = []
+            flow_masks_b = []
+            for i in range(n_frames):
+                if i == n_frames - 1:
+                    fwd_flow, fwd_mask = np.zeros((sh[0], sh[1], 2)), np.zeros((sh[0], sh[1]))
+                else:
+                    fwd_flow_path = os.path.join(flow_dir, '%05d_fwd.npz' % i)
+                    fwd_data = np.load(fwd_flow_path)
+                    fwd_flow, fwd_mask = fwd_data['flow'], fwd_data['mask']
+                    fwd_flow = resize_flow(fwd_flow, sh[0], sh[1])
+                    fwd_mask = np.float32(fwd_mask)
+                    fwd_mask = cv2.resize(fwd_mask, (sh[1], sh[0]),
+                                          interpolation=cv2.INTER_NEAREST)
+                flows_f.append(fwd_flow)
+                flow_masks_f.append(fwd_mask)
+
+                if i == 0:
+                    bwd_flow, bwd_mask = np.zeros((sh[0], sh[1], 2)), np.zeros((sh[0], sh[1]))
+                else:
+                    bwd_flow_path = os.path.join(flow_dir, '%05d_bwd.npz' % i)
+                    bwd_data = np.load(bwd_flow_path)
+                    bwd_flow, bwd_mask = bwd_data['flow'], bwd_data['mask']
+                    bwd_flow = resize_flow(bwd_flow, sh[0], sh[1])
+                    bwd_mask = np.float32(bwd_mask)
+                    bwd_mask = cv2.resize(bwd_mask, (sh[1], sh[0]),
+                                          interpolation=cv2.INTER_NEAREST)
+                flows_b.append(bwd_flow)
+                flow_masks_b.append(bwd_mask)
+
+            flows_f = np.stack(flows_f, -1)
+            flow_masks_f = np.stack(flow_masks_f, -1)
+            flows_b = np.stack(flows_b, -1)
+            flow_masks_b = np.stack(flow_masks_b, -1)
+
+            print(imgs.shape)
+            print(disp.shape)
+            print(masks.shape)
+            print(flows_f.shape)
+            print(flow_masks_f.shape)
+
+            assert (imgs.shape[0] == disp.shape[0])
+            assert (imgs.shape[0] == masks.shape[0])
+            assert (imgs.shape[0] == flows_f.shape[0])
+            assert (imgs.shape[0] == flow_masks_f.shape[0])
+
+            assert (imgs.shape[1] == disp.shape[1])
+            assert (imgs.shape[1] == masks.shape[1])
+
+            factor = None
+            all_masks[serial] = masks
+            all_flows_f[serial] = flows_f
+            all_flow_masks_f[serial] = flow_masks_f
+            all_flows_b[serial] = flows_b
+            all_flow_masks_b[serial] = flow_masks_b
+
+    return all_poses, all_bds, all_imgs, all_disp, all_masks, \
+           all_flows_f, all_flow_masks_f, all_flows_b, all_flow_masks_b, all_dist_masks
+
+
 def normalize(x):
     return x / np.linalg.norm(x)
 
@@ -362,6 +539,91 @@ def load_llff_data(args, basedir,
 
     return images, disp, masks, poses, bds,\
         render_poses, render_focals, grids
+
+
+def load_DFVS_data(basedir, start_frame, end_frame, args,
+                   target_idx=10, final_height=288):
+    all_poses, all_bds, all_imgs, all_disp, all_masks, all_flows_f, all_flow_masks_f, \
+    all_flows_b, all_flow_masks_b,  all_dist_masks \
+        = _load_data_DFVS(basedir, start_frame, end_frame, args,
+                          height=final_height, evaluation=False)
+
+    images_out = {}
+    disp_out = {}
+    masks_out = {}
+    poses_out = {}
+    bds_out = {}
+    render_poses_out = {}
+    c2w_out = {}
+    grids_out = {}
+
+    ref_pose = all_poses[args.gt_serial][...,0][:3,:3]
+    ref_pose = np.concatenate([ref_pose[:, 0:1], -ref_pose[:, 1:2], -ref_pose[:, 2:3]], 1)
+    reorient_trans = np.linalg.inv(ref_pose)
+    recenter_trans = -all_poses[args.gt_serial][...,0][:3,3:4]
+    recenter_trans[1:3] = -recenter_trans[1:3]
+
+    for serial in args.serial_list:
+        poses = all_poses[serial]
+        bds = all_bds[serial]
+        imgs = all_imgs[serial]
+        print('Loaded', basedir, bds.min(), bds.max())
+
+        # Correct rotation matrix ordering and move variable dim to axis 0
+        # note: target coord-sys (graphics) : x: right, y: up, z:out-of,
+        #  cv convention in target coord-sys: [x, -y, -z]
+        poses = np.concatenate([poses[:, 0:1, :], -poses[:, 1:2, :], -poses[:, 2:3, :], poses[:, 3:, :]], 1)
+        poses[1:3, 3,:] = -poses[1:3, 3,:]
+        poses = np.moveaxis(poses, -1, 0).astype(np.float32)
+        images = np.moveaxis(imgs, -1, 0).astype(np.float32)
+        bds = np.moveaxis(bds, -1, 0).astype(np.float32)
+
+        # Rescale if bd_factor is provided
+        sc = 1.
+
+        poses[:, :3, 3] *= sc
+
+        bds *= sc
+
+        poses[:,:3,:3] = reorient_trans[None] @ poses[:,:3,:3]
+        poses[:,:3,3:4] = poses[:,:3,3:4] + recenter_trans[None]
+
+        c2w = poses[target_idx, :, :]
+
+        images = images.astype(np.float32)
+        images_out[serial] = images
+        poses = poses.astype(np.float32)
+        poses_out[serial] = poses
+        bds_out[serial] = bds
+
+        disp = all_disp[serial]
+        disp = np.moveaxis(disp, -1, 0).astype(np.float32)
+        disp = disp.astype(np.float32)
+        disp_out[serial] = disp
+
+        if serial != args.gt_serial:
+            masks = all_masks[serial]
+            masks = np.moveaxis(masks, -1, 0).astype(np.float32)
+            masks = masks.astype(np.float32)
+            masks_out[serial] = masks
+
+            # render_poses_out[serial] = render_poses
+            c2w_out[serial] = c2w  # reference pose
+
+            flows_f = np.moveaxis(all_flows_f[serial], -1, 0).astype(np.float32)
+            flow_masks_f = np.moveaxis(all_flow_masks_f[serial], -1, 0).astype(np.float32)
+            flows_b = np.moveaxis(all_flows_b[serial], -1, 0).astype(np.float32)
+            flow_masks_b = np.moveaxis(all_flow_masks_b[serial], -1, 0).astype(np.float32)
+            grids_out[serial] = get_grid(int(h), int(w), len(poses), flows_f, flow_masks_f,
+                                         flows_b, flow_masks_b)  # [N, H, W, 8]
+
+    for serial in args.serial_list:
+        if serial != args.gt_serial:
+            render_poses_out[serial] = poses_out[args.gt_serial]
+
+    return images_out, disp_out, masks_out, poses_out, bds_out, \
+           render_poses_out, c2w_out, grids_out, all_dist_masks
+
 
 
 def generate_path(c2w, args):

@@ -55,7 +55,7 @@ def render(t, chain_5frames,
       acc_map: [batch_size]. Accumulated opacity (alpha) along a ray.
       extras: dict with everything returned by render_rays().
     """
-
+    device = focal.device
     if c2w is not None:
         # special case to render full image
         if focal_render is not None:
@@ -75,7 +75,7 @@ def render(t, chain_5frames,
         # Make all directions unit magnitude.
         # shape: [batch_size, 3]
         viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
-        viewdirs = torch.reshape(viewdirs, [-1, 3]).float()
+        viewdirs = torch.reshape(viewdirs, [-1, 3]).float().to(device)
 
     sh = rays_d.shape # [..., 3]
     if ndc:
@@ -83,10 +83,10 @@ def render(t, chain_5frames,
         rays_o, rays_d = ndc_rays(H, W, focal, 1., rays_o, rays_d)
 
     # Create ray batch
-    rays_o = torch.reshape(rays_o, [-1, 3]).float()
-    rays_d = torch.reshape(rays_d, [-1, 3]).float()
+    rays_o = torch.reshape(rays_o, [-1, 3]).float().to(device)
+    rays_d = torch.reshape(rays_d, [-1, 3]).float().to(device)
     near, far = near * \
-        torch.ones_like(rays_d[..., :1]), far * torch.ones_like(rays_d[..., :1])
+        torch.ones_like(rays_d[..., :1]).to(device), far * torch.ones_like(rays_d[..., :1]).to(device)
 
     # (ray origin, ray direction, min dist, max dist) for each ray
     rays = torch.cat([rays_o, rays_d, near, far], -1)
@@ -340,17 +340,18 @@ def raw2outputs(raw_s,
       weights: [num_rays, num_samples]. Weights assigned to each sampled color.
       depth_map: [num_rays]. Estimated distance to object.
     """
+    device = raw_s.device
     # Function for computing density from model prediction. This value is
     # strictly between [0, 1].
     def raw2alpha(raw, dists, act_fn=F.relu): return 1.0 - \
-        torch.exp(-act_fn(raw) * dists)
+        torch.exp(-act_fn(raw) * dists).to(device)
 
     # Compute 'distance' (in time) between each integration time along a ray.
     dists = z_vals[..., 1:] - z_vals[..., :-1]
 
     # The 'distance' from the last integration time is infinity.
     dists = torch.cat(
-        [dists, torch.Tensor([1e10]).expand(dists[..., :1].shape)],
+        [dists, torch.Tensor([1e10]).expand(dists[..., :1].shape).to(device)],
          -1) # [N_rays, N_samples]
 
     # Multiply each distance by the norm of its corresponding direction ray
@@ -365,7 +366,7 @@ def raw2outputs(raw_s,
     # regularize network during training (prevents floater artifacts).
     noise = 0.
     if raw_noise_std > 0.:
-        noise = torch.randn(raw_d[..., 3].shape) * raw_noise_std
+        noise = torch.randn(raw_d[..., 3].shape).to(device) * raw_noise_std
 
     # Predict density of each sample along each ray. Higher values imply
     # higher likelihood of being absorbed at this point.
@@ -373,9 +374,9 @@ def raw2outputs(raw_s,
     alpha_s = raw2alpha(raw_s[..., 3] + noise, dists) # [N_rays, N_samples]
     alphas  = 1. - (1. - alpha_s) * (1. - alpha_d) # [N_rays, N_samples]
 
-    T_d    = torch.cumprod(torch.cat([torch.ones((alpha_d.shape[0], 1)), 1. - alpha_d + 1e-10], -1), -1)[:, :-1]
-    T_s    = torch.cumprod(torch.cat([torch.ones((alpha_s.shape[0], 1)), 1. - alpha_s + 1e-10], -1), -1)[:, :-1]
-    T_full = torch.cumprod(torch.cat([torch.ones((alpha_d.shape[0], 1)), (1. - alpha_d * blending) * (1. - alpha_s * (1. - blending)) + 1e-10], -1), -1)[:, :-1]
+    T_d    = torch.cumprod(torch.cat([torch.ones((alpha_d.shape[0], 1)).to(device), 1. - alpha_d + 1e-10], -1), -1)[:, :-1]
+    T_s    = torch.cumprod(torch.cat([torch.ones((alpha_s.shape[0], 1)).to(device), 1. - alpha_s + 1e-10], -1), -1)[:, :-1]
+    T_full = torch.cumprod(torch.cat([torch.ones((alpha_d.shape[0], 1)).to(device), (1. - alpha_d * blending) * (1. - alpha_s * (1. - blending)) + 1e-10], -1), -1)[:, :-1]
     # T_full = torch.cumprod(torch.cat([torch.ones((alpha_d.shape[0], 1)), torch.pow(1. - alpha_d + 1e-10, blending) * torch.pow(1. - alpha_s + 1e-10, 1. - blending)], -1), -1)[:, :-1]
     # T_full = torch.cumprod(torch.cat([torch.ones((alpha_d.shape[0], 1)), (1. - alpha_d) * (1. - alpha_s) + 1e-10], -1), -1)[:, :-1]
 
@@ -417,18 +418,18 @@ def raw2outputs_d(raw_d,
                   z_vals,
                   rays_d,
                   raw_noise_std):
-
+    device = raw_d.device
     # Function for computing density from model prediction. This value is
     # strictly between [0, 1].
     def raw2alpha(raw, dists, act_fn=F.relu): return 1.0 - \
-        torch.exp(-act_fn(raw) * dists)
+        torch.exp(-act_fn(raw) * dists).to(device)
 
     # Compute 'distance' (in time) between each integration time along a ray.
     dists = z_vals[..., 1:] - z_vals[..., :-1]
 
     # The 'distance' from the last integration time is infinity.
     dists = torch.cat(
-        [dists, torch.Tensor([1e10]).expand(dists[..., :1].shape)],
+        [dists, torch.Tensor([1e10]).expand(dists[..., :1].shape).to(device)],
         -1)  # [N_rays, N_samples]
 
     # Multiply each distance by the norm of its corresponding direction ray
@@ -442,13 +443,13 @@ def raw2outputs_d(raw_d,
     # regularize network during training (prevents floater artifacts).
     noise = 0.
     if raw_noise_std > 0.:
-        noise = torch.randn(raw_d[..., 3].shape) * raw_noise_std
+        noise = torch.randn(raw_d[..., 3].shape).to(device) * raw_noise_std
 
     # Predict density of each sample along each ray. Higher values imply
     # higher likelihood of being absorbed at this point.
     alpha_d = raw2alpha(raw_d[..., 3] + noise, dists)  # [N_rays, N_samples]
 
-    T_d = torch.cumprod(torch.cat([torch.ones((alpha_d.shape[0], 1)), 1. - alpha_d + 1e-10], -1), -1)[:, :-1]
+    T_d = torch.cumprod(torch.cat([torch.ones((alpha_d.shape[0], 1)).to(device), 1. - alpha_d + 1e-10], -1), -1)[:, :-1]
     # Compute weight for RGB of each sample along each ray.  A cumprod() is
     # used to express the idea of the ray not having reflected up to this
     # sample yet.
@@ -504,7 +505,7 @@ def render_rays(t,
       z_std: [num_rays]. Standard deviation of distances along ray for each
         sample.
     """
-
+    device = ray_batch.device
     # batch size
     N_rays = ray_batch.shape[0]
 
@@ -527,7 +528,7 @@ def render_rays(t,
 
     # Decide where to sample along each ray. Under the logic, all rays will be sampled at
     # the same times.
-    t_vals = torch.linspace(0., 1., steps=N_samples)
+    t_vals = torch.linspace(0., 1., steps=N_samples).to(device)
     if not lindisp:
         # Space integration times linearly between 'near' and 'far'. Same
         # integration points will be used for all rays.
@@ -544,7 +545,7 @@ def render_rays(t,
         upper = torch.cat([mids, z_vals[..., -1:]], -1)
         lower = torch.cat([z_vals[..., :1], mids], -1)
         # stratified samples in those intervals
-        t_rand = torch.rand(z_vals.shape)
+        t_rand = torch.rand(z_vals.shape).to(device)
         z_vals = lower + (upper - lower) * t_rand
 
     # Points in space to evaluate model at.
@@ -552,7 +553,7 @@ def render_rays(t,
         z_vals[..., :, None] # [N_rays, N_samples, 3]
 
     # Add the time dimension to xyz.
-    pts_ref = torch.cat([pts, torch.ones_like(pts[..., 0:1]) * t], -1)
+    pts_ref = torch.cat([pts, torch.ones_like(pts[..., 0:1]).to(device) * t], -1)
 
     # First pass: we have the staticNeRF results
     raw_s = network_query_fn_s(pts_ref[..., :3], viewdirs, network_fn_s)
@@ -611,8 +612,8 @@ def render_rays(t,
            'dynamicness_map': dynamicness_map}
 
     t_interval = 1. / num_img * 2.
-    pts_f = torch.cat([pts + sceneflow_f, torch.ones_like(pts[..., 0:1]) * (t + t_interval)], -1)
-    pts_b = torch.cat([pts + sceneflow_b, torch.ones_like(pts[..., 0:1]) * (t - t_interval)], -1)
+    pts_f = torch.cat([pts + sceneflow_f, torch.ones_like(pts[..., 0:1]).to(device) * (t + t_interval)], -1)
+    pts_b = torch.cat([pts + sceneflow_b, torch.ones_like(pts[..., 0:1]).to(device) * (t - t_interval)], -1)
 
     ret['sceneflow_b'] = sceneflow_b
     ret['sceneflow_f'] = sceneflow_f
@@ -658,7 +659,7 @@ def render_rays(t,
     # Also consider time t - 2 and t + 2 (Learn from NSFF)
 
     # Fifth pass: we have the DyanmicNeRF results at time t - 2
-    pts_b_b = torch.cat([pts_b[..., :3] + sceneflow_b_b, torch.ones_like(pts[..., 0:1]) * (t - t_interval * 2)], -1)
+    pts_b_b = torch.cat([pts_b[..., :3] + sceneflow_b_b, torch.ones_like(pts[..., 0:1]).to(device) * (t - t_interval * 2)], -1)
     ret['raw_pts_b_b'] = pts_b_b[..., :3]
 
     if chain_5frames:
@@ -672,7 +673,7 @@ def render_rays(t,
         ret['rgb_map_d_b_b'] = rgb_map_d_b_b
 
     # Sixth pass: we have the DyanmicNeRF results at time t + 2
-    pts_f_f = torch.cat([pts_f[..., :3] + sceneflow_f_f, torch.ones_like(pts[..., 0:1]) * (t + t_interval * 2)], -1)
+    pts_f_f = torch.cat([pts_f[..., :3] + sceneflow_f_f, torch.ones_like(pts[..., 0:1]).to(device) * (t + t_interval * 2)], -1)
     ret['raw_pts_f_f'] = pts_f_f[..., :3]
 
     if chain_5frames:

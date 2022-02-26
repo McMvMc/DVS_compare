@@ -1,0 +1,41 @@
+expname = seq_45_DyNeRF
+basedir = ./logs
+datadir = /playpen-ssd/mikewang/nerf_data/
+
+dataset_type = DFVS
+
+factor = 1
+N_rand = 1792
+N_samples = 64
+N_importance = 0
+netwidth = 256
+
+i_video = 2000
+i_testset = 100000
+N_iters = 200000
+i_img = 500
+
+use_viewdirs = True
+use_viewdirsDyn = True
+raw_noise_std = 1e0
+no_ndc = False
+lindisp = False
+
+dynamic_loss_lambda = 1.0
+static_loss_lambda = 1.0
+full_loss_lambda = 3.0
+depth_loss_lambda = 0.04
+order_loss_lambda = 0.1
+flow_loss_lambda = 0.02
+slow_loss_lambda = 0.01
+smooth_loss_lambda = 0.1
+consistency_loss_lambda = 1.0
+mask_loss_lambda = 0.1
+sparse_loss_lambda = 0.001
+DyNeRF_blending = True
+pretrain = True
+
+final_height = 504
+start_frame = 70
+end_frame = 100
+target_idx = 14

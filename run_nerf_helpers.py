@@ -4,6 +4,7 @@ import imageio
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -249,7 +250,7 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
-
+    rank = args.rank
     embed_fn_d, input_ch_d = get_embedder(args.multires, args.i_embed, 4)
     # 10 * 2 * 4 + 4 = 84
     # L * (sin, cos) * (x, y, z, t) + (x, y, z, t)
@@ -266,10 +267,9 @@ def create_nerf(args):
     model_d = NeRF_d(D=args.netdepth, W=args.netwidth,
                      input_ch=input_ch_d, output_ch=output_ch, skips=skips,
                      input_ch_views=input_ch_views,
-                     use_viewdirsDyn=args.use_viewdirsDyn).to(device)
+                     use_viewdirsDyn=args.use_viewdirsDyn)
 
     device_ids = list(range(torch.cuda.device_count()))
-    model_d = torch.nn.DataParallel(model_d, device_ids=device_ids)
     grad_vars = list(model_d.parameters())
 
     embed_fn_s, input_ch_s = get_embedder(args.multires, args.i_embed, 3)
@@ -279,9 +279,15 @@ def create_nerf(args):
     model_s = NeRF_s(D=args.netdepth, W=args.netwidth,
                      input_ch=input_ch_s, output_ch=output_ch, skips=skips,
                      input_ch_views=input_ch_views,
-                     use_viewdirs=args.use_viewdirs).to(device)
+                     use_viewdirs=args.use_viewdirs)
 
-    model_s = torch.nn.DataParallel(model_s, device_ids=device_ids)
+    if rank is not None:
+        model_d = DDP(model_d.to(rank), find_unused_parameters=True)
+        model_s = DDP(model_s.to(rank), find_unused_parameters=True)
+    else:
+        model_d = torch.nn.DataParallel(model_d.to(device), device_ids=device_ids)
+        model_s = torch.nn.DataParallel(model_s.to(device), device_ids=device_ids)
+
     grad_vars += list(model_s.parameters())
 
     model_fine = None
@@ -315,7 +321,7 @@ def create_nerf(args):
     }
 
     # NDC only good for LLFF-style forward facing data
-    if args.dataset_type != 'llff' or args.no_ndc:
+    if args.dataset_type not in ['llff', 'DFVS'] or args.no_ndc:
         print('Not ndc!')
         render_kwargs_train['ndc'] = False
         render_kwargs_train['lindisp'] = args.lindisp
@@ -327,6 +333,8 @@ def create_nerf(args):
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
     render_kwargs_test['inference'] = True
+    render_kwargs_test['network_fn_d'] = model_d.module
+    render_kwargs_test['network_fn_s'] = model_s.module
 
     # Create optimizer
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
@@ -359,10 +367,11 @@ def create_nerf(args):
 
 # Ray helpers
 def get_rays(H, W, focal, c2w):
+    device = c2w.device
     """Get ray origins, directions from a pinhole camera."""
     i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H)) # pytorch's meshgrid has indexing='ij'
-    i = i.t()
-    j = j.t()
+    i = i.t().to(device)
+    j = j.t().to(device)
     dirs = torch.stack([(i-W*.5)/focal, -(j-H*.5)/focal, -torch.ones_like(i)], -1)
     # Rotate ray directions from camera frame to the world frame
     rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1) # dot product, equals to: [c2w.dot(dir) for dir in dirs]
